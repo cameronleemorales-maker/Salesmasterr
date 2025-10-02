@@ -1,154 +1,98 @@
-name: Android CI
+name: build
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-  workflow_dispatch: {}
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  ZIP_NAME: SalesMaster.zip     # <— rename if your ZIP has a different name
+  UNZIP_DIR: project            # where we unzip the project
 
 jobs:
-  build:
+  android:
     runs-on: ubuntu-latest
 
-    env:
-      ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
-      ANDROID_HOME: ${{ github.workspace }}/android-sdk
-      JAVA_HOME_17_X64: /usr/lib/jvm/temurin-17-jdk-amd64
-
     steps:
-      # --- Checkout ---------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
-      # --- Locate & unzip ZIP (handles any name/casing) --------------------
-      - name: Locate ZIP (repo root)
-        id: findzip
-        shell: bash
+      - name: Verify ZIP exists (repo root)
         run: |
-          set -e
-          shopt -s nullglob
-          zips=( *.zip )
-          if [[ ${#zips[@]} -eq 0 ]]; then
-            echo "No ZIP file found in repo root." >&2
-            exit 1
-          fi
-          # Pick the first zip (or change to pick a specific one)
-          echo "zip_name=${zips[0]}" >> "$GITHUB_OUTPUT"
-          echo "Found ZIP: ${zips[0]}"
+          ls -la
+          test -f "$ZIP_NAME" || { echo "ZIP '$ZIP_NAME' not found in repo root."; exit 1; }
 
       - name: Unzip project
-        shell: bash
         run: |
-          set -e
-          rm -rf project
-          mkdir -p project
-          unzip -q "${{ steps.findzip.outputs.zip_name }}" -d project
-          echo "Unzipped into ./project"
-          # Show top-level of project for debugging
-          ls -la project | sed -n '1,200p'
+          rm -rf "$UNZIP_DIR"
+          mkdir -p "$UNZIP_DIR"
+          unzip -q "$ZIP_NAME" -d "$UNZIP_DIR"
 
-      # --- Detect Gradle project root (supports nested dirs) ---------------
       - name: Detect Gradle project root
-        id: gradleroot
+        id: detect
         shell: bash
         run: |
           set -e
-          root=""
-          while IFS= read -r -d '' f; do
-            dir="$(dirname "$f")"
-            root="$dir"
-            break
-          done < <(find project -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -print0 | sort -z)
-          if [[ -z "$root" ]]; then
-            echo "No Gradle settings file found in unzipped project." >&2
-            find project -maxdepth 3 -type f | sed -n '1,200p'
+          ROOT=""
+          # Prefer a folder that has settings.gradle(.kts)
+          CANDIDATES=$(find "$UNZIP_DIR" -maxdepth 3 -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \))
+          if [ -n "$CANDIDATES" ]; then
+            ROOT=$(dirname "$(echo "$CANDIDATES" | head -n1)")
+          else
+            # Fallback: look for build.gradle(.kts) in typical app module structure
+            CANDIDATES=$(find "$UNZIP_DIR" -maxdepth 3 -type f \( -name "build.gradle" -o -name "build.gradle.kts" \))
+            [ -n "$CANDIDATES" ] && ROOT=$(dirname "$(echo "$CANDIDATES" | head -n1)")
+          fi
+          if [ -z "$ROOT" ]; then
+            echo "Could not locate a Gradle project (no settings.gradle* or build.gradle* found)."
             exit 1
           fi
-          echo "root=$root" >> "$GITHUB_OUTPUT"
-          echo "Detected Gradle root: $root"
+          echo "project_dir=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "Detected Gradle root: $ROOT"
 
-      # --- Set up JDK 17 ---------------------------------------------------
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # --- Prepare Android SDK cmdline-tools -------------------------------
-      - name: Set Android SDK env
-        shell: bash
-        run: |
-          set -e
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
-          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
-          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
+      # Reliable Android SDK/cmdline-tools + auto-accept licenses
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Install Android platforms & build-tools
-        shell: bash
-        run: |
-          set -e
-          SDK="$ANDROID_SDK_ROOT"
-          mkdir -p "$SDK/cmdline-tools"
-          cd "$SDK/cmdline-tools"
-
-          echo "Downloading Android commandline-tools..."
-          curl -sSL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o clt.zip
-
-          rm -rf latest temp && mkdir temp
-          unzip -q clt.zip -d temp
-          mv temp/cmdline-tools latest
-          rm -rf temp clt.zip
-
-          echo "Verify sdkmanager:"
-          ls -la latest/bin
-
-          # Accept licenses (ignore broken-pipe noise)
-          yes | latest/bin/sdkmanager --licenses || true
-
-          # Install core packages
-          latest/bin/sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0"
-
-      # --- Gradle cache (official action) ----------------------------------
+      # Pin a Gradle version compatible with AGP (avoids Gradle 9.x issues)
       - name: Set up Gradle (cache & tools)
         uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+          cache-read-only: false
 
-      # --- Fix wrapper permissions if present ------------------------------
       - name: Fix gradlew permissions (if present)
-        working-directory: ${{ steps.gradleroot.outputs.root }}
-        shell: bash
+        working-directory: ${{ steps.detect.outputs.project_dir }}
         run: |
-          set -e
-          if [[ -f "./gradlew" ]]; then
+          if [ -f "./gradlew" ]; then
             chmod +x ./gradlew
           fi
-          if [[ -d "./gradle/wrapper" ]]; then
-            chmod -R u+rwX,go+rX ./gradle/wrapper || true
-          fi
 
-      # --- Build using wrapper if present; else system Gradle --------------
       - name: Build Debug APK
-        working-directory: ${{ steps.gradleroot.outputs.root }}
+        working-directory: ${{ steps.detect.outputs.project_dir }}
         shell: bash
         run: |
           set -e
-          if [[ -x "./gradlew" ]]; then
+          if [ -x "./gradlew" ]; then
             echo "Using Gradle Wrapper"
-            ./gradlew --no-daemon --stacktrace assembleDebug
+            ./gradlew --no-daemon assembleDebug
           else
             echo "No wrapper found — using system Gradle"
             gradle --version
-            gradle --no-daemon --stacktrace assembleDebug
+            gradle --no-daemon assembleDebug
           fi
 
-      # --- Upload APK(s) (v4, not deprecated) ------------------------------
       - name: Upload Debug APK(s)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-apks
           path: |
-            ${{ steps.gradleroot.outputs.root }}/**/build/outputs/apk/**/*.apk
+            ${{ steps.detect.outputs.project_dir }}/**/*.apk
           if-no-files-found: error
